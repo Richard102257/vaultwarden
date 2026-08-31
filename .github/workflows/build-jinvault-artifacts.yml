@@ -127,7 +127,7 @@ jobs:
             | sort -Vu \
             | tail -1
 
-          tar -C release -czf jinvault-bundle.tar.gz jinvault web-vault
+          tar -C release -czf release/jinvault-bundle.tar.gz jinvault web-vault
           sha256sum release/jinvault release/jinvault-bundle.tar.gz \
             > release/SHA256SUMS
 
