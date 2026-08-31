@@ -1,0 +1,140 @@
+name: Build JinVault deployment artifacts
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+    paths:
+      - ".github/workflows/build-jinvault-artifacts.yml"
+      - "src/**"
+      - "migrations/**"
+      - "Cargo.*"
+      - "build.rs"
+      - "rust-toolchain.toml"
+      - "macros/**"
+
+concurrency:
+  group: jinvault-artifacts-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: Build Linux amd64 deployment artifacts
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+
+    steps:
+      - name: Check out backend
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check out frontend
+        uses: actions/checkout@v4
+        with:
+          repository: Richard102257/bitwarden-clients
+          ref: master
+          path: bitwarden-clients
+          fetch-depth: 1
+          # For a private frontend fork, create a read-only PAT secret named
+          # FRONTEND_REPO_TOKEN. For a public fork, GITHUB_TOKEN is sufficient.
+          token: ${{ secrets.FRONTEND_REPO_TOKEN || github.token }}
+          persist-credentials: false
+
+      - name: Install backend build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            ca-certificates \
+            libpq-dev \
+            libssl-dev \
+            pkg-config
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.17.0
+          cache: npm
+          cache-dependency-path: bitwarden-clients/package-lock.json
+
+      - name: Build Web Vault
+        working-directory: bitwarden-clients
+        env:
+          NX_DAEMON: "false"
+        run: |
+          node --version
+          npm --version
+          npm ci --no-audit --no-fund
+          ./node_modules/.bin/nx run web:build:oss-selfhost
+          test -f dist/apps/web/oss-selfhost/index.html
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: jinvault-ubuntu-22.04
+
+      - name: Build backend
+        env:
+          CARGO_BUILD_JOBS: "2"
+        run: |
+          rustc --version
+          cargo --version
+          cargo build \
+            --profile release-low \
+            --features postgresql \
+            --locked
+
+      - name: Assemble deployment artifact
+        run: |
+          set -Eeuo pipefail
+          rm -rf release
+          mkdir -p release/web-vault
+          cp -a bitwarden-clients/dist/apps/web/oss-selfhost/. release/web-vault/
+
+          if [[ -x target/release-low/jinvault ]]; then
+            cp target/release-low/jinvault release/jinvault
+          elif [[ -x target/release-low/vaultwarden ]]; then
+            cp target/release-low/vaultwarden release/jinvault
+          else
+            echo "No release-low backend binary found" >&2
+            find target/release-low -maxdepth 1 -type f -print >&2 || true
+            exit 1
+          fi
+
+          chmod 0755 release/jinvault
+          test -f release/web-vault/index.html
+          file release/jinvault
+
+          echo "Maximum GLIBC symbol required by backend:"
+          readelf --version-info release/jinvault \
+            | grep -oE 'GLIBC_[0-9.]+' \
+            | sort -Vu \
+            | tail -1
+
+          tar -C release -czf jinvault-bundle.tar.gz jinvault web-vault
+          sha256sum release/jinvault release/jinvault-bundle.tar.gz \
+            > release/SHA256SUMS
+
+      - name: Upload deployment artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: jinvault-linux-amd64
+          path: release
+          if-no-files-found: error
+          retention-days: 14
