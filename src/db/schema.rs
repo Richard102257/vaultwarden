@@ -185,6 +185,21 @@ table! {
 }
 
 table! {
+    email_code_challenges (uuid) {
+        uuid -> Text,
+        email -> Text,
+        purpose -> Text,
+        code_hash -> Text,
+        code_salt -> Text,
+        created_at -> Timestamp,
+        expires_at -> Timestamp,
+        last_sent_at -> Timestamp,
+        attempts -> Integer,
+        ip_address -> Text,
+    }
+}
+
+table! {
     users (uuid) {
         uuid -> Text,
         enabled -> Bool,
@@ -408,4 +423,5 @@ allow_tables_to_appear_in_same_query!(
     collections_groups,
     event,
     auth_requests,
+    email_code_challenges,
 );

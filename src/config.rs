@@ -623,6 +623,14 @@ make_config! {
         signups_verify_resend_time: u64, true,  def,    3_600;
         /// If signups require email verification, limit how many emails are automatically sent when login is attempted (0 means no limit)
         signups_verify_resend_limit: u32, true, def,    6;
+        /// Enable the separate email one-time code option for web password login and registration.
+        email_code_auth_enabled: bool, true, def, true;
+        /// Lifetime of a web login/registration email code in seconds.
+        email_code_expiration: u64, true, def, 600;
+        /// Minimum delay between email code sends for the same email and purpose in seconds.
+        email_code_resend_time: u64, true, def, 60;
+        /// Maximum number of failed attempts for one email code challenge.
+        email_code_max_attempts: u32, true, def, 5;
         /// Email domain whitelist |> Allow signups only from this list of comma-separated domains, even when signups are otherwise disabled
         signups_domains_whitelist: String, true, def,   String::new();
         /// Enable event logging |> Enables event logging for organizations.
@@ -1746,6 +1754,7 @@ where
     reg!("email/incomplete_2fa_login", ".html");
     reg!("email/invite_accepted", ".html");
     reg!("email/invite_confirmed", ".html");
+    reg!("email/email_code", ".html");
     reg!("email/new_device_logged_in", ".html");
     reg!("email/protected_action", ".html");
     reg!("email/pw_hint_none", ".html");

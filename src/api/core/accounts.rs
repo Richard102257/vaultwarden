@@ -21,8 +21,9 @@ use crate::{
         DbConn, DbPool,
         models::{
             AuthRequest, AuthRequestId, Cipher, CipherId, Device, DeviceId, DeviceType, DeviceWithAuthRequest,
-            EmergencyAccess, EmergencyAccessId, EventType, Folder, FolderId, Invitation, Membership, MembershipId,
-            OrgPolicy, OrgPolicyType, Organization, OrganizationId, Send, SendId, User, UserId, UserKdfType,
+            EmailCodeChallenge, EmergencyAccess, EmergencyAccessId, EventType, Folder, FolderId, Invitation,
+            Membership, MembershipId, OrgPolicy, OrgPolicyType, Organization, OrganizationId, Send, SendId, User,
+            UserId, UserKdfType,
         },
     },
     mail,
@@ -110,6 +111,9 @@ pub struct RegisterData {
 
     // Used only from the register/finish endpoint
     email_verification_token: Option<String>,
+    email_code_challenge_id: Option<String>,
+    email_code: Option<String>,
+    client_type: Option<String>,
     accept_emergency_access_id: Option<EmergencyAccessId>,
     accept_emergency_access_invite_token: Option<String>,
     #[serde(alias = "token")]
@@ -265,6 +269,26 @@ pub async fn register(data: Json<RegisterData>, email_verification: bool, conn: 
 
     if data.unprocessable() {
         err_code!("Unexpected RegisterData format", Status::UnprocessableEntity.code);
+    }
+
+    // Registration requires the standalone mailbox code, including direct
+    // organization invites.  Keep the challenge alive until the immediate
+    // post-registration login so the user does not need a second email.
+    let web_registration = matches!(data.client_type.as_deref(), Some("web") | Some("browser"));
+    if email_verification && CONFIG.email_code_auth_enabled() && web_registration {
+        let challenge_id = data.email_code_challenge_id.as_deref().unwrap_or_default();
+        let code = data.email_code.as_deref().unwrap_or_default();
+        if challenge_id.is_empty() || code.is_empty() {
+            err!("Email verification code required")
+        }
+        EmailCodeChallenge::verify_without_consuming(
+            challenge_id,
+            &email,
+            EmailCodeChallenge::REGISTRATION,
+            code,
+            &conn,
+        )
+        .await?;
     }
 
     // First, validate the provided verification tokens

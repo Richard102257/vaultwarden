@@ -568,6 +568,29 @@ pub async fn send_token(address: &str, token: &str) -> EmptyResult {
     send_email(address, &subject, body_html, body_text).await
 }
 
+/// Send the standalone login/registration email code.  This intentionally uses
+/// a separate template from the existing email-2FA template so users can tell
+/// which action requested the code.
+pub async fn send_email_code(address: &str, code: &str, purpose: &str) -> EmptyResult {
+    let purpose_label = if purpose == "registration" {
+        "registration"
+    } else {
+        "login"
+    };
+    let (subject, body_html, body_text) = get_text(
+        "email/email_code",
+        json!({
+            "url": CONFIG.domain(),
+            "img_src": CONFIG._smtp_img_src(),
+            "code": code,
+            "purpose": purpose_label,
+            "expiration": CONFIG.email_code_expiration() / 60,
+        }),
+    )?;
+
+    send_email(address, &subject, body_html, body_text).await
+}
+
 pub async fn send_change_email(address: &str, token: &str) -> EmptyResult {
     let (subject, body_html, body_text) = get_text(
         "email/change_email",

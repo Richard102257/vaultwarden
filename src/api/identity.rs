@@ -30,9 +30,9 @@ use crate::{
     db::{
         DbConn,
         models::{
-            AuthRequest, AuthRequestId, Device, DeviceId, EventType, Invitation, OIDCCodeResponseError,
-            OrganizationApiKey, OrganizationId, SendId, SsoAuth, SsoUser, TwoFactor, TwoFactorIncomplete,
-            TwoFactorType, User, UserId,
+            AuthRequest, AuthRequestId, Device, DeviceId, EmailCodeChallenge, EventType, Invitation,
+            OIDCCodeResponseError, OrganizationApiKey, OrganizationId, SendId, SsoAuth, SsoUser, TwoFactor,
+            TwoFactorIncomplete, TwoFactorType, User, UserId,
         },
     },
     error::MapResult,
@@ -48,6 +48,7 @@ pub fn routes() -> Vec<Route> {
         prelogin_password,
         identity_register,
         register_verification_email,
+        send_email_code,
         register_finish,
         prevalidate,
         authorize,
@@ -147,6 +148,87 @@ async fn login(
     }
 
     login_result
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SendEmailCodeData {
+    email: String,
+    purpose: String,
+}
+
+/// Issue a short-lived code for the custom web authentication flow.  The
+/// response is intentionally generic for unknown/disallowed addresses so this
+/// endpoint cannot be used to enumerate accounts.
+#[post("/accounts/email-code/send", data = "<data>")]
+async fn send_email_code(data: Json<SendEmailCodeData>, client_headers: ClientHeaders, conn: DbConn) -> JsonResult {
+    crate::ratelimit::check_limit_unauthenticated(&client_headers.ip.ip)?;
+
+    let data = data.into_inner();
+    let email = data.email.trim().to_lowercase();
+    let purpose = data.purpose.trim().to_lowercase();
+    if !util::is_valid_email(&email)
+        || !matches!(purpose.as_str(), EmailCodeChallenge::LOGIN | EmailCodeChallenge::REGISTRATION)
+    {
+        // Keep the same shape as a successful response to avoid leaking which
+        // validation branch was taken.
+        return Ok(Json(json!({
+            "object": "emailCodeChallenge",
+            "challengeId": Value::Null,
+            "expiresIn": CONFIG.email_code_expiration(),
+            "retryAfter": CONFIG.email_code_resend_time(),
+        })));
+    }
+
+    let eligible = match purpose.as_str() {
+        EmailCodeChallenge::LOGIN => User::find_by_mail(&email, &conn).await.is_some(),
+        EmailCodeChallenge::REGISTRATION => {
+            CONFIG.is_signup_allowed(&email)
+                || Invitation::find_by_mail(&email, &conn).await.is_some()
+                || User::find_by_mail(&email, &conn).await.is_some_and(|u| u.password_hash.is_empty())
+        }
+        _ => false,
+    };
+
+    if !eligible || !CONFIG.mail_enabled() {
+        return Ok(Json(json!({
+            "object": "emailCodeChallenge",
+            "challengeId": Value::Null,
+            "expiresIn": CONFIG.email_code_expiration(),
+            "retryAfter": CONFIG.email_code_resend_time(),
+        })));
+    }
+
+    if let Some(existing) = EmailCodeChallenge::find_by_email_and_purpose(&email, &purpose, &conn).await {
+        let elapsed = Utc::now().naive_utc().signed_duration_since(existing.last_sent_at).num_seconds();
+        let cooldown = CONFIG.email_code_resend_time() as i64;
+        if elapsed < cooldown {
+            return Ok(Json(json!({
+                "object": "emailCodeChallenge",
+                "challengeId": existing.uuid,
+                "expiresIn": CONFIG.email_code_expiration(),
+                "retryAfter": (cooldown - elapsed) as u64,
+            })));
+        }
+    }
+
+    EmailCodeChallenge::delete_by_email_and_purpose(&email, &purpose, &conn).await?;
+    let code = crypto::generate_email_token(6);
+    let challenge = EmailCodeChallenge::new(&email, &purpose, &code, &client_headers.ip.ip.to_string());
+    let challenge_id = challenge.uuid.clone();
+    challenge.save(&conn).await?;
+
+    if let Err(error) = mail::send_email_code(&email, &code, &purpose).await {
+        challenge.delete(&conn).await.ok();
+        return Err(error);
+    }
+
+    Ok(Json(json!({
+        "object": "emailCodeChallenge",
+        "challengeId": challenge_id,
+        "expiresIn": CONFIG.email_code_expiration(),
+        "retryAfter": CONFIG.email_code_resend_time(),
+    })))
 }
 
 async fn refresh_login(data: ConnectData, conn: &DbConn, ip: &ClientIp) -> JsonResult {
@@ -392,7 +474,36 @@ async fn password_login(
         )
     }
 
-    let password = data.password.as_ref().unwrap();
+    // The custom web client supports two independent login methods: the regular
+    // master password, or a short-lived mailbox code. Only requests that carry
+    // an explicit challenge use the code path. The challenge is consumed before
+    // issuing tokens, so a stolen/expired code cannot be replayed.
+    let email_code_login = should_validate_email_code(&data);
+    if email_code_login {
+        let challenge_id = data.email_code_challenge_id.as_deref().unwrap_or_default();
+        let code = data.email_code.as_deref().unwrap_or_default();
+        if challenge_id.is_empty() || code.is_empty() {
+            err_json!(json!({"EmailCodeRequired": true}), "Email verification code required")
+        }
+        let purpose = data
+            .email_code_purpose
+            .as_deref()
+            .filter(|p| matches!(*p, EmailCodeChallenge::LOGIN | EmailCodeChallenge::REGISTRATION))
+            .unwrap_or(EmailCodeChallenge::LOGIN);
+        EmailCodeChallenge::consume(challenge_id, username, purpose, code, conn).await?;
+
+        // A successful mailbox challenge is also an explicit email
+        // verification. Mark the account as verified so this login method is
+        // not blocked by the legacy signup-verification reminder below.
+        if user.verified_at.is_none() {
+            user.verified_at = Some(Utc::now().naive_utc());
+            if let Err(error) = user.save(conn).await {
+                error!("Error marking email as verified after email-code login: {error:#?}");
+            }
+        }
+    }
+
+    let password = data.password.as_deref().unwrap_or_default();
 
     // If we get an auth request, we don't check the user's password, but the access code of the auth request
     if let Some(ref auth_request_id) = data.auth_request {
@@ -423,7 +534,7 @@ async fn password_login(
                 }
             )
         }
-    } else if !user.check_valid_password(password) {
+    } else if !email_code_login && !user.check_valid_password(password) {
         err!(
             "Username or password is incorrect. Try again",
             format!("IP: {}. Username: {username}.", ip.ip),
@@ -434,13 +545,13 @@ async fn password_login(
     }
 
     // Change the KDF Iterations (only when not logging in with an auth request)
-    if data.auth_request.is_none() {
+    if data.auth_request.is_none() && !email_code_login {
         kdf_upgrade(&mut user, password, conn).await?;
     }
 
     let now = Utc::now().naive_utc();
 
-    if user.verified_at.is_none() && CONFIG.mail_enabled() && CONFIG.signups_verify() {
+    if !email_code_login && user.verified_at.is_none() && CONFIG.mail_enabled() && CONFIG.signups_verify() {
         if user.last_verifying_at.is_none()
             || now.signed_duration_since(user.last_verifying_at.unwrap()).num_seconds()
                 > CONFIG.signups_verify_resend_time().cast_signed()
@@ -479,6 +590,13 @@ async fn password_login(
     let auth_tokens = auth::AuthTokens::new(&device, &user, AuthMethod::Password, data.client_id);
 
     authenticated_response(&user, &mut device, auth_tokens, twofactor_token, conn, ip).await
+}
+
+fn should_validate_email_code(data: &ConnectData) -> bool {
+    CONFIG.email_code_auth_enabled()
+        && data.auth_request.is_none()
+        && matches!(data.client_id.as_deref(), Some("web") | Some("browser"))
+        && (data.email_code.is_some() || data.email_code_challenge_id.is_some())
 }
 
 async fn authenticated_response(
@@ -1155,6 +1273,17 @@ struct ConnectData {
     two_factor_remember: Option<i32>,
     #[field(name = uncased("authrequest"))]
     auth_request: Option<AuthRequestId>,
+
+    // Standalone email-code authentication used by the custom web client.
+    #[field(name = uncased("email_code"))]
+    #[field(name = uncased("emailcode"))]
+    email_code: Option<String>,
+    #[field(name = uncased("email_code_challenge_id"))]
+    #[field(name = uncased("emailcodechallengeid"))]
+    email_code_challenge_id: Option<String>,
+    #[field(name = uncased("email_code_purpose"))]
+    #[field(name = uncased("emailcodepurpose"))]
+    email_code_purpose: Option<String>,
 
     // Needed for authorization code
     #[field(name = uncased("code"))]
