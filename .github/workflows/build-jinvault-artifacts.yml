@@ -3,6 +3,16 @@ name: Build JinVault deployment artifacts
 permissions:
   contents: read
 
+# To enable the deploy job, create a GitHub Environment named "production",
+# enable required reviewers for it, add the repository variable
+# ENABLE_PRODUCTION_DEPLOY=true, and add these environment secrets:
+#   VP_HOST, VP_USER, VP_PORT (optional; defaults to 22)
+#   VP_SSH_PRIVATE_KEY, VP_KNOWN_HOSTS
+# Optional ProxyJump values (when VP is reachable only through a bastion):
+#   VP_JUMP_HOST, VP_JUMP_USER, VP_JUMP_PORT (defaults to 22)
+# The deploy key must be authorized on VP (and on the bastion when the same key
+# is used). VP_KNOWN_HOSTS must contain the pinned host keys for every hop.
+
 on:
   workflow_dispatch:
   push:
@@ -128,8 +138,10 @@ jobs:
             | tail -1
 
           tar -C release -czf release/jinvault-bundle.tar.gz jinvault web-vault
-          sha256sum release/jinvault release/jinvault-bundle.tar.gz \
-            > release/SHA256SUMS
+          (
+            cd release
+            sha256sum jinvault jinvault-bundle.tar.gz > SHA256SUMS
+          )
 
       - name: Upload deployment artifact
         uses: actions/upload-artifact@v4
@@ -138,3 +150,177 @@ jobs:
           path: release
           if-no-files-found: error
           retention-days: 14
+
+  deploy-production:
+    name: Deploy to VP (production)
+    needs: build
+    # The production environment should have required reviewers enabled in
+    # repository settings. The job can therefore run after a successful build
+    # without allowing an unreviewed push to restart the production service.
+    environment:
+      name: production
+    # Set the repository variable ENABLE_PRODUCTION_DEPLOY=true only after
+    # the SSH secrets and the production environment have been configured.
+    # Keeping the default false makes the first workflow commit non-invasive.
+    if: ${{ github.ref == 'refs/heads/master' && vars.ENABLE_PRODUCTION_DEPLOY == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+
+    steps:
+      - name: Download deployment artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: jinvault-linux-amd64
+          path: release
+
+      - name: Verify artifact
+        run: |
+          set -Eeuo pipefail
+          test -x release/jinvault
+          test -f release/jinvault-bundle.tar.gz
+          test -f release/SHA256SUMS
+          (cd release && sha256sum -c SHA256SUMS)
+          file release/jinvault
+
+      - name: Configure SSH
+        env:
+          VP_SSH_PRIVATE_KEY: ${{ secrets.VP_SSH_PRIVATE_KEY }}
+          VP_KNOWN_HOSTS: ${{ secrets.VP_KNOWN_HOSTS }}
+        run: |
+          set -Eeuo pipefail
+          test -n "$VP_SSH_PRIVATE_KEY" || { echo 'Missing production secret VP_SSH_PRIVATE_KEY' >&2; exit 1; }
+          test -n "$VP_KNOWN_HOSTS" || { echo 'Missing production secret VP_KNOWN_HOSTS' >&2; exit 1; }
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$VP_SSH_PRIVATE_KEY" > "$HOME/.ssh/id_jinvault_deploy"
+          chmod 600 "$HOME/.ssh/id_jinvault_deploy"
+          printf '%s\n' "$VP_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 644 "$HOME/.ssh/known_hosts"
+
+      - name: Upload and activate release
+        env:
+          VP_HOST: ${{ secrets.VP_HOST }}
+          VP_PORT: ${{ secrets.VP_PORT || '22' }}
+          VP_USER: ${{ secrets.VP_USER }}
+          VP_JUMP_HOST: ${{ secrets.VP_JUMP_HOST }}
+          VP_JUMP_PORT: ${{ secrets.VP_JUMP_PORT || '22' }}
+          VP_JUMP_USER: ${{ secrets.VP_JUMP_USER }}
+          RELEASE: ${{ github.sha }}
+        run: |
+          set -Eeuo pipefail
+
+          test -n "$VP_HOST" || { echo 'Missing production secret VP_HOST' >&2; exit 1; }
+          test -n "$VP_USER" || { echo 'Missing production secret VP_USER' >&2; exit 1; }
+
+          SSH_ARGS=(
+            -i "$HOME/.ssh/id_jinvault_deploy"
+            -o IdentitiesOnly=yes
+            -o BatchMode=yes
+            -o StrictHostKeyChecking=yes
+            -o ConnectTimeout=15
+            -p "$VP_PORT"
+          )
+          if [[ -n "$VP_JUMP_HOST" ]]; then
+            JUMP_TARGET="${VP_JUMP_HOST}"
+            [[ -n "$VP_JUMP_USER" ]] && JUMP_TARGET="${VP_JUMP_USER}@${JUMP_TARGET}"
+            [[ -n "$VP_JUMP_PORT" ]] && JUMP_TARGET="${JUMP_TARGET}:${VP_JUMP_PORT}"
+            SSH_ARGS+=( -o "ProxyJump=$JUMP_TARGET" )
+          fi
+          TARGET="${VP_USER}@${VP_HOST}"
+
+          ssh "${SSH_ARGS[@]}" "$TARGET" true
+          REMOTE_TMP="$(ssh "${SSH_ARGS[@]}" "$TARGET" 'mktemp -d /tmp/jinvault-deploy.XXXXXX')"
+          trap 'ssh "${SSH_ARGS[@]}" "$TARGET" "rm -rf -- $REMOTE_TMP" >/dev/null 2>&1 || true' EXIT
+
+          scp "${SSH_ARGS[@]}" \
+            release/jinvault-bundle.tar.gz \
+            release/SHA256SUMS \
+            "$TARGET:$REMOTE_TMP/"
+
+          ssh "${SSH_ARGS[@]}" "$TARGET" bash -s -- "$REMOTE_TMP" "$RELEASE" <<'REMOTE_SCRIPT'
+          set -Eeuo pipefail
+
+          UPLOAD_DIR="$1"
+          RELEASE="$2"
+          APP_DIR=/opt/jinvault
+          DATA_DIR=/var/lib/jinvault
+          SERVICE=jinvault.service
+          trap 'rm -rf -- "$UPLOAD_DIR"' EXIT
+
+          command -v sha256sum >/dev/null || { echo 'sha256sum is required on VP' >&2; exit 1; }
+          command -v tar >/dev/null || { echo 'tar is required on VP' >&2; exit 1; }
+          command -v curl >/dev/null || { echo 'curl is required on VP for the health check' >&2; exit 1; }
+          command -v sudo >/dev/null || { echo 'sudo is required on VP' >&2; exit 1; }
+          cd "$UPLOAD_DIR"
+          sha256sum -c SHA256SUMS
+
+          sudo test -x "$APP_DIR/jinvault" || { echo "Missing $APP_DIR/jinvault; run the one-time standalone setup first." >&2; exit 1; }
+          sudo test -d "$APP_DIR/web-vault" || { echo "Missing $APP_DIR/web-vault; run the one-time standalone setup first." >&2; exit 1; }
+          sudo test -d "$DATA_DIR" || { echo "Missing $DATA_DIR; run the one-time standalone setup first." >&2; exit 1; }
+          sudo systemctl cat "$SERVICE" >/dev/null || { echo "Missing $SERVICE; run the one-time standalone setup first." >&2; exit 1; }
+          for credential in database-url admin-token; do
+            sudo test -s "/etc/jinvault/credentials/$credential" || {
+              echo "Missing /etc/jinvault/credentials/$credential" >&2
+              exit 1
+            }
+          done
+
+          RELEASE_DIR="$APP_DIR/releases/$RELEASE"
+          sudo install -d -o root -g jinvault -m 0750 "$RELEASE_DIR/web-vault"
+          sudo tar -xzf jinvault-bundle.tar.gz -C "$RELEASE_DIR"
+          sudo install -o root -g root -m 0755 "$RELEASE_DIR/jinvault" "$RELEASE_DIR/jinvault.new"
+          sudo rm -f "$RELEASE_DIR/jinvault"
+          sudo mv "$RELEASE_DIR/jinvault.new" "$RELEASE_DIR/jinvault"
+          sudo chown -R root:jinvault "$RELEASE_DIR/web-vault"
+          sudo find "$RELEASE_DIR/web-vault" -type d -exec chmod 0750 {} +
+          sudo find "$RELEASE_DIR/web-vault" -type f -exec chmod 0640 {} +
+
+          # Keep the previous application files as a local rollback copy. No
+          # database or /var/lib/jinvault data is removed by this deployment.
+          PREVIOUS_BINARY="$APP_DIR/jinvault.prev.$RELEASE"
+          PREVIOUS_WEB_VAULT="$APP_DIR/web-vault.prev.$RELEASE"
+          if sudo test -e "$APP_DIR/jinvault"; then
+            sudo mv "$APP_DIR/jinvault" "$APP_DIR/jinvault.prev.$RELEASE"
+          fi
+          if sudo test -e "$APP_DIR/web-vault"; then
+            sudo mv "$APP_DIR/web-vault" "$APP_DIR/web-vault.prev.$RELEASE"
+          fi
+          sudo mv "$RELEASE_DIR/jinvault" "$APP_DIR/jinvault"
+          sudo mv "$RELEASE_DIR/web-vault" "$APP_DIR/web-vault"
+          sudo rmdir "$RELEASE_DIR" 2>/dev/null || true
+
+          if ! sudo systemctl restart "$SERVICE"; then
+            echo 'New release failed to start; restoring the previous files.' >&2
+            sudo rm -f "$APP_DIR/jinvault"
+            sudo rm -rf "$APP_DIR/web-vault"
+            sudo mv "$PREVIOUS_BINARY" "$APP_DIR/jinvault"
+            sudo mv "$PREVIOUS_WEB_VAULT" "$APP_DIR/web-vault"
+            sudo systemctl restart "$SERVICE" || true
+            exit 1
+          fi
+          sleep 2
+          if ! sudo systemctl is-active --quiet "$SERVICE"; then
+            sudo systemctl --no-pager --full status "$SERVICE" || true
+            sudo journalctl -u "$SERVICE" -n 60 --no-pager || true
+            echo 'Restoring the previous files after the failed health check.' >&2
+            sudo rm -f "$APP_DIR/jinvault"
+            sudo rm -rf "$APP_DIR/web-vault"
+            sudo mv "$PREVIOUS_BINARY" "$APP_DIR/jinvault"
+            sudo mv "$PREVIOUS_WEB_VAULT" "$APP_DIR/web-vault"
+            sudo systemctl restart "$SERVICE" || true
+            exit 1
+          fi
+          if ! curl --fail --silent --show-error http://127.0.0.1:8000/alive >/dev/null; then
+            echo 'Health check failed; restoring the previous files.' >&2
+            sudo systemctl stop "$SERVICE" || true
+            sudo rm -f "$APP_DIR/jinvault"
+            sudo rm -rf "$APP_DIR/web-vault"
+            sudo mv "$PREVIOUS_BINARY" "$APP_DIR/jinvault"
+            sudo mv "$PREVIOUS_WEB_VAULT" "$APP_DIR/web-vault"
+            sudo systemctl start "$SERVICE" || true
+            exit 1
+          fi
+          echo "JinVault release $RELEASE is active on VP."
+          REMOTE_SCRIPT
