@@ -76,6 +76,8 @@ jobs:
         working-directory: bitwarden-clients
         env:
           NX_DAEMON: "false"
+          NG_BUILD_MAX_WORKERS: "1"
+          NODE_OPTIONS: "--max_old_space_size=6144"
         run: |
           node --version
           npm --version
