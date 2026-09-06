@@ -15,6 +15,7 @@ on:
       - master
     paths:
       - ".github/workflows/build-jinvault-artifacts.yml"
+      - ".github/jinvault-frontend-ref"
       - "src/**"
       - "migrations/**"
       - "Cargo.*"
@@ -43,11 +44,19 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Resolve frontend revision
+        id: frontend_ref
+        run: |
+          set -Eeuo pipefail
+          frontend_ref="$(tr -d '[:space:]' < .github/jinvault-frontend-ref)"
+          test -n "$frontend_ref"
+          echo "ref=$frontend_ref" >> "$GITHUB_OUTPUT"
+
       - name: Check out frontend
         uses: actions/checkout@v4
         with:
           repository: Richard102257/bitwarden-clients
-          ref: master
+          ref: ${{ steps.frontend_ref.outputs.ref }}
           path: bitwarden-clients
           fetch-depth: 1
           # For a private frontend fork, create a read-only PAT secret named
